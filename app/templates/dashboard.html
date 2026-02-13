@@ -1,0 +1,143 @@
+{% extends "base.html" %}
+{% block content %}
+<script>
+document.getElementById('nav-right').innerHTML =
+  '<button onclick="logout()" class="text-sm underline">Logout</button>';
+
+let currentUrn = '';
+
+async function logout() {
+  await fetch('/auth/logout', {method:'POST'});
+  location.reload();
+}
+
+async function analyzePost() {
+  const url = document.getElementById('post-url').value.trim();
+  if (!url) return;
+  setStatus('Analyzing post...');
+  try {
+    const res = await fetch('/api/analyze-post', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({url})
+    });
+    const data = await res.json();
+    if (!res.ok) { setStatus(data.detail || 'Error'); return; }
+    currentUrn = data.urn;
+    const postText = document.getElementById('post-text');
+    if (data.text) {
+      postText.value = data.text;
+      setStatus('Post loaded. Generate replies when ready.');
+    } else {
+      postText.value = '';
+      postText.placeholder = 'Could not fetch post text automatically. Paste the post content here.';
+      setStatus('Paste the post text manually, then generate replies.');
+    }
+    document.getElementById('post-section').classList.remove('hidden');
+  } catch(e) { setStatus('Network error'); }
+}
+
+async function generateReplies() {
+  const postText = document.getElementById('post-text').value.trim();
+  if (!postText) { setStatus('Enter post text first'); return; }
+  const tone = document.getElementById('tone').value;
+  const ctx = document.getElementById('user-context').value.trim();
+  setStatus('Generating smart replies...');
+  document.getElementById('suggestions').innerHTML = '';
+  try {
+    const res = await fetch('/api/generate-replies', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({post_text:postText, post_urn:currentUrn, tone, user_context:ctx||null})
+    });
+    const data = await res.json();
+    if (!res.ok) { setStatus(data.detail || 'Error'); return; }
+    renderSuggestions(data.suggestions);
+    setStatus('Pick a reply to post, or edit first.');
+  } catch(e) { setStatus('Network error'); }
+}
+
+function renderSuggestions(suggestions) {
+  const el = document.getElementById('suggestions');
+  el.innerHTML = '';
+  suggestions.forEach((text, i) => {
+    const card = document.createElement('div');
+    card.className = 'bg-white rounded-lg shadow p-4 mb-3';
+    card.innerHTML = `
+      <textarea id="reply-${i}" class="w-full border rounded p-2 text-sm mb-2" rows="3">${text}</textarea>
+      <button onclick="postComment(${i})"
+        class="bg-blue-600 hover:bg-blue-700 text-white text-sm font-medium py-1.5 px-4 rounded transition">
+        Post This
+      </button>
+    `;
+    el.appendChild(card);
+  });
+}
+
+async function postComment(idx) {
+  const text = document.getElementById(`reply-${idx}`).value.trim();
+  if (!text || !currentUrn) return;
+  setStatus('Posting comment...');
+  try {
+    const res = await fetch('/api/post-comment', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({post_urn:currentUrn, comment_text:text})
+    });
+    const data = await res.json();
+    if (!res.ok) { setStatus(data.detail || 'Error posting'); return; }
+    setStatus('Comment posted successfully!');
+  } catch(e) { setStatus('Network error'); }
+}
+
+function setStatus(msg) {
+  document.getElementById('status').textContent = msg;
+}
+</script>
+
+<!-- URL input -->
+<div class="bg-white rounded-xl shadow-md p-6 mb-6">
+  <label class="block text-sm font-medium text-gray-700 mb-2">LinkedIn Post URL</label>
+  <div class="flex gap-2">
+    <input id="post-url" type="text" placeholder="https://www.linkedin.com/feed/update/..."
+      class="flex-1 border rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500">
+    <button onclick="analyzePost()"
+      class="bg-blue-600 hover:bg-blue-700 text-white font-medium py-2 px-5 rounded-lg transition text-sm">
+      Analyze
+    </button>
+  </div>
+</div>
+
+<!-- Post content + options -->
+<div id="post-section" class="hidden bg-white rounded-xl shadow-md p-6 mb-6">
+  <label class="block text-sm font-medium text-gray-700 mb-2">Post Content</label>
+  <textarea id="post-text" rows="5"
+    class="w-full border rounded-lg px-3 py-2 text-sm mb-4 focus:outline-none focus:ring-2 focus:ring-blue-500"
+    placeholder="Post text will appear here..."></textarea>
+
+  <div class="grid grid-cols-2 gap-4 mb-4">
+    <div>
+      <label class="block text-xs font-medium text-gray-500 mb-1">Tone</label>
+      <select id="tone" class="w-full border rounded px-2 py-1.5 text-sm">
+        <option value="professional">Professional</option>
+        <option value="casual">Casual</option>
+        <option value="technical">Technical</option>
+        <option value="thoughtful">Thoughtful</option>
+      </select>
+    </div>
+    <div>
+      <label class="block text-xs font-medium text-gray-500 mb-1">Your Context (optional)</label>
+      <input id="user-context" type="text" placeholder="e.g. I'm a software engineer"
+        class="w-full border rounded px-2 py-1.5 text-sm">
+    </div>
+  </div>
+
+  <button onclick="generateReplies()"
+    class="bg-green-600 hover:bg-green-700 text-white font-medium py-2 px-6 rounded-lg transition text-sm">
+    Generate Replies
+  </button>
+</div>
+
+<!-- Suggestions -->
+<div id="suggestions"></div>
+
+<!-- Status -->
+<p id="status" class="text-sm text-gray-500 mt-4 text-center"></p>
+{% endblock %}
