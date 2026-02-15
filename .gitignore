@@ -7,3 +7,4 @@ tokens.json
 dist/
 build/
 .mypy_cache/
+.linkedin-browser/

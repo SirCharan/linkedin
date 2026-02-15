@@ -1,143 +1,147 @@
-"""LinkedIn Voyager API client for posting comments.
+"""LinkedIn comment poster using Playwright browser automation.
 
-Uses the linkedin_api package (unofficial) with browser cookie authentication.
+Uses a persistent browser context so you only need to log in once.
+The session persists across restarts via a local browser profile.
 """
 
-import json
 import logging
+import os
 import time
 
-from linkedin_api import Linkedin
-from requests.cookies import RequestsCookieJar
-
-from app.config import settings
+from playwright.sync_api import sync_playwright, BrowserContext, Playwright
 
 logger = logging.getLogger(__name__)
 
-_client: Linkedin | None = None
-_client_ts: float = 0
+_pw: Playwright | None = None
+_context: BrowserContext | None = None
+_profile_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", ".linkedin-browser")
 
 
-def _no_evade():
-    """Skip the default 2-5s delay for faster operation."""
-    pass
+def _get_browser_context() -> BrowserContext:
+    """Return a persistent Chrome context (launches once, reuses after)."""
+    global _pw, _context
+    if _context:
+        return _context
+
+    profile = os.path.abspath(_profile_dir)
+    logger.info(f"Launching Chrome with profile at {profile}")
+    _pw = sync_playwright().start()
+    _context = _pw.chromium.launch_persistent_context(
+        user_data_dir=profile,
+        headless=False,
+        channel="chrome",
+        args=["--disable-blink-features=AutomationControlled"],
+        viewport={"width": 1280, "height": 900},
+    )
+    logger.info("Browser context ready")
+    return _context
 
 
-def get_voyager_client() -> Linkedin:
-    """Return a cached Voyager client using browser cookies."""
-    global _client, _client_ts
-    if _client and (time.time() - _client_ts < 21600):
-        return _client
-
-    li_at = settings.linkedin_li_at
-    jsessionid = settings.linkedin_jsessionid
-    if not li_at or not jsessionid:
-        raise RuntimeError(
-            "LINKEDIN_LI_AT and LINKEDIN_JSESSIONID must be set in .env. "
-            "Get these from your browser's LinkedIn cookies."
+def _ensure_logged_in(page) -> bool:
+    """Navigate to LinkedIn feed and check if we're logged in."""
+    page.goto("https://www.linkedin.com/feed/", wait_until="domcontentloaded", timeout=30000)
+    # If redirected to login, we're not authenticated
+    if "/login" in page.url or "/uas/" in page.url or "/checkpoint" in page.url:
+        logger.warning(
+            "Not logged in to LinkedIn. Please log in via the browser window "
+            "that just opened, then try again."
         )
-
-    logger.info("Setting up Voyager client with browser cookies...")
-    cookies = RequestsCookieJar()
-    cookies.set("li_at", li_at, domain=".linkedin.com", path="/")
-    cookies.set("JSESSIONID", f'"{jsessionid}"', domain=".linkedin.com", path="/")
-
-    # Create client without authenticating, then inject cookies
-    api = Linkedin("", "", authenticate=False)
-    api.client._set_session_cookies(cookies)
-
-    _client = api
-    _client_ts = time.time()
-    logger.info("Voyager client ready")
-    return _client
+        # Wait up to 120s for user to log in manually
+        for _ in range(60):
+            time.sleep(2)
+            if "/feed" in page.url and "/login" not in page.url:
+                logger.info("Login detected!")
+                return True
+        return False
+    return True
 
 
 def post_comment(activity_id: str, comment_text: str) -> dict:
-    """Post a comment on a LinkedIn post via the Voyager API.
+    """Post a comment on a LinkedIn post via browser automation.
 
     :param activity_id: The numeric activity ID (e.g. '7130492810985676800')
     :param comment_text: The comment text to post
-    :return: dict with success status and response details
+    :return: dict with success status
     """
-    api = get_voyager_client()
+    ctx = _get_browser_context()
+    page = ctx.new_page()
 
-    # Attempt 1: /feed/comments with parentUrn
-    payload = json.dumps({
-        "commentary": {
-            "text": comment_text,
-            "attributesV2": [],
-        },
-        "parentUrn": f"urn:li:activity:{activity_id}",
-        "$type": "com.linkedin.voyager.feed.shared.SocialComment",
-    })
-
-    res = api._post(
-        "/feed/comments",
-        evade=_no_evade,
-        data=payload,
-        headers={"Content-Type": "application/json"},
-    )
-
-    logger.info(f"Attempt 1 (/feed/comments parentUrn): {res.status_code}")
-    if res.status_code in (200, 201):
-        return _parse_response(res)
-
-    # Attempt 2: /feed/comments with threadUrn (fsd_update format)
-    payload2 = json.dumps({
-        "threadUrn": f"urn:li:fsd_update:(urn:li:activity:{activity_id},FEED_DETAIL,EMPTY,DEFAULT,false)",
-        "commentary": {
-            "text": comment_text,
-            "attributesV2": [],
-        },
-    })
-
-    res2 = api._post(
-        "/feed/comments",
-        evade=_no_evade,
-        data=payload2,
-        headers={"Content-Type": "application/json"},
-    )
-
-    logger.info(f"Attempt 2 (/feed/comments threadUrn): {res2.status_code}")
-    if res2.status_code in (200, 201):
-        return _parse_response(res2)
-
-    # Attempt 3: /voyagerSocialDashComments
-    payload3 = json.dumps({
-        "threadUrn": f"urn:li:activity:{activity_id}",
-        "text": comment_text,
-    })
-
-    res3 = api._post(
-        "/voyagerSocialDashComments",
-        evade=_no_evade,
-        params={"action": "create"},
-        data=payload3,
-        headers={"Content-Type": "application/json"},
-    )
-
-    logger.info(f"Attempt 3 (/voyagerSocialDashComments): {res3.status_code}")
-    if res3.status_code in (200, 201):
-        return _parse_response(res3)
-
-    # All attempts failed — collect diagnostics
-    errors = []
-    for i, r in enumerate([res, res2, res3], 1):
-        try:
-            body = r.json()
-        except Exception:
-            body = r.text[:300]
-        errors.append(f"Attempt {i}: {r.status_code} -> {body}")
-
-    error_msg = " | ".join(errors)
-    raise RuntimeError(f"All comment posting attempts failed. {error_msg}")
-
-
-def _parse_response(res) -> dict:
     try:
-        return {"success": True, "data": res.json()}
-    except Exception:
-        return {"success": True, "data": res.text}
+        # Check login
+        if not _ensure_logged_in(page):
+            raise RuntimeError(
+                "Not logged in to LinkedIn. Please log in via the browser "
+                "window and retry."
+            )
+
+        # Navigate to the post
+        post_url = f"https://www.linkedin.com/feed/update/urn:li:activity:{activity_id}/"
+        logger.info(f"Navigating to {post_url}")
+        page.goto(post_url, wait_until="domcontentloaded", timeout=30000)
+        page.wait_for_timeout(2000)
+
+        # Click the comment button to open the comment box
+        comment_btn = page.locator(
+            "button.comment-button, "
+            "button[aria-label*='Comment'], "
+            "button[aria-label*='comment'], "
+            "span.comment-button"
+        ).first
+        if comment_btn.is_visible():
+            comment_btn.click()
+            page.wait_for_timeout(1000)
+
+        # Find and fill the comment text box
+        comment_box = page.locator(
+            "div.ql-editor[data-placeholder*='Add a comment'], "
+            "div.ql-editor[contenteditable='true'], "
+            "div[role='textbox'][aria-label*='comment' i], "
+            "div[role='textbox'][aria-label*='Add a comment' i], "
+            "div.comments-comment-box__form div[contenteditable='true']"
+        ).first
+
+        comment_box.wait_for(state="visible", timeout=10000)
+        comment_box.click()
+        page.wait_for_timeout(500)
+
+        # Type the comment
+        comment_box.fill(comment_text)
+        page.wait_for_timeout(500)
+
+        # Click the submit/post button
+        submit_btn = page.locator(
+            "button.comments-comment-box__submit-button, "
+            "button[aria-label*='Post comment'], "
+            "button[type='submit'][class*='comment']"
+        ).first
+
+        if not submit_btn.is_visible():
+            # Fallback: look for any enabled submit-like button near the comment box
+            submit_btn = page.locator(
+                "form.comments-comment-box__form button[type='submit'], "
+                "button.artdeco-button--primary"
+            ).last
+
+        submit_btn.wait_for(state="visible", timeout=5000)
+        submit_btn.click()
+
+        # Wait for the comment to be posted
+        page.wait_for_timeout(3000)
+
+        logger.info(f"Comment posted on activity {activity_id}")
+        return {"success": True, "data": "Comment posted via browser"}
+
+    except Exception as e:
+        logger.error(f"Failed to post comment: {e}")
+        # Take a screenshot for debugging
+        try:
+            page.screenshot(path=f".linkedin-browser/error-{activity_id}.png")
+            logger.info(f"Error screenshot saved to .linkedin-browser/error-{activity_id}.png")
+        except Exception:
+            pass
+        raise RuntimeError(f"Browser comment posting failed: {e}")
+    finally:
+        page.close()
 
 
 def extract_activity_id(urn: str) -> str:
