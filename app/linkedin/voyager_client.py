@@ -1,15 +1,14 @@
 """LinkedIn Voyager API client for posting comments.
 
-Uses the linkedin_api package (unofficial) which authenticates via
-LinkedIn's internal Voyager API — the same API the website uses.
+Uses the linkedin_api package (unofficial) with browser cookie authentication.
 """
 
 import json
 import logging
 import time
-from functools import lru_cache
 
 from linkedin_api import Linkedin
+from requests.cookies import RequestsCookieJar
 
 from app.config import settings
 
@@ -25,20 +24,31 @@ def _no_evade():
 
 
 def get_voyager_client() -> Linkedin:
-    """Return a cached Voyager client, re-authenticating every 6 hours."""
+    """Return a cached Voyager client using browser cookies."""
     global _client, _client_ts
     if _client and (time.time() - _client_ts < 21600):
         return _client
 
-    if not settings.linkedin_email or not settings.linkedin_password:
+    li_at = settings.linkedin_li_at
+    jsessionid = settings.linkedin_jsessionid
+    if not li_at or not jsessionid:
         raise RuntimeError(
-            "LINKEDIN_EMAIL and LINKEDIN_PASSWORD must be set in .env"
+            "LINKEDIN_LI_AT and LINKEDIN_JSESSIONID must be set in .env. "
+            "Get these from your browser's LinkedIn cookies."
         )
 
-    logger.info("Authenticating with LinkedIn Voyager API...")
-    _client = Linkedin(settings.linkedin_email, settings.linkedin_password)
+    logger.info("Setting up Voyager client with browser cookies...")
+    cookies = RequestsCookieJar()
+    cookies.set("li_at", li_at, domain=".linkedin.com", path="/")
+    cookies.set("JSESSIONID", f'"{jsessionid}"', domain=".linkedin.com", path="/")
+
+    # Create client without authenticating, then inject cookies
+    api = Linkedin("", "", authenticate=False)
+    api.client._set_session_cookies(cookies)
+
+    _client = api
     _client_ts = time.time()
-    logger.info("Voyager authentication successful")
+    logger.info("Voyager client ready")
     return _client
 
 
@@ -51,7 +61,7 @@ def post_comment(activity_id: str, comment_text: str) -> dict:
     """
     api = get_voyager_client()
 
-    # The Voyager API endpoint for creating comments
+    # Attempt 1: /feed/comments with parentUrn
     payload = json.dumps({
         "commentary": {
             "text": comment_text,
@@ -68,13 +78,11 @@ def post_comment(activity_id: str, comment_text: str) -> dict:
         headers={"Content-Type": "application/json"},
     )
 
+    logger.info(f"Attempt 1 (/feed/comments parentUrn): {res.status_code}")
     if res.status_code in (200, 201):
-        try:
-            return {"success": True, "data": res.json()}
-        except Exception:
-            return {"success": True, "data": res.text}
+        return _parse_response(res)
 
-    # If that format didn't work, try alternative payload format
+    # Attempt 2: /feed/comments with threadUrn (fsd_update format)
     payload2 = json.dumps({
         "threadUrn": f"urn:li:fsd_update:(urn:li:activity:{activity_id},FEED_DETAIL,EMPTY,DEFAULT,false)",
         "commentary": {
@@ -90,14 +98,11 @@ def post_comment(activity_id: str, comment_text: str) -> dict:
         headers={"Content-Type": "application/json"},
     )
 
+    logger.info(f"Attempt 2 (/feed/comments threadUrn): {res2.status_code}")
     if res2.status_code in (200, 201):
-        try:
-            return {"success": True, "data": res2.json()}
-        except Exception:
-            return {"success": True, "data": res2.text}
+        return _parse_response(res2)
 
-    # Try the dash-style endpoint as last resort
-    params = {"action": "create"}
+    # Attempt 3: /voyagerSocialDashComments
     payload3 = json.dumps({
         "threadUrn": f"urn:li:activity:{activity_id}",
         "text": comment_text,
@@ -106,27 +111,33 @@ def post_comment(activity_id: str, comment_text: str) -> dict:
     res3 = api._post(
         "/voyagerSocialDashComments",
         evade=_no_evade,
-        params=params,
+        params={"action": "create"},
         data=payload3,
         headers={"Content-Type": "application/json"},
     )
 
+    logger.info(f"Attempt 3 (/voyagerSocialDashComments): {res3.status_code}")
     if res3.status_code in (200, 201):
-        try:
-            return {"success": True, "data": res3.json()}
-        except Exception:
-            return {"success": True, "data": res3.text}
+        return _parse_response(res3)
 
-    # All attempts failed — return the first error for debugging
-    error_detail = f"Status {res.status_code}"
+    # All attempts failed — collect diagnostics
+    errors = []
+    for i, r in enumerate([res, res2, res3], 1):
+        try:
+            body = r.json()
+        except Exception:
+            body = r.text[:300]
+        errors.append(f"Attempt {i}: {r.status_code} -> {body}")
+
+    error_msg = " | ".join(errors)
+    raise RuntimeError(f"All comment posting attempts failed. {error_msg}")
+
+
+def _parse_response(res) -> dict:
     try:
-        error_detail = res.json()
+        return {"success": True, "data": res.json()}
     except Exception:
-        error_detail = res.text[:500]
-    raise RuntimeError(
-        f"Comment posting failed. Status: {res.status_code}, "
-        f"Response: {error_detail}"
-    )
+        return {"success": True, "data": res.text}
 
 
 def extract_activity_id(urn: str) -> str:

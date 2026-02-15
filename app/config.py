@@ -9,6 +9,8 @@ class Settings(BaseSettings):
     linkedin_api_version: str = "202502"
     linkedin_email: str = ""
     linkedin_password: str = ""
+    linkedin_li_at: str = ""
+    linkedin_jsessionid: str = ""
     ollama_base_url: str = "http://localhost:11434"
     ollama_model: str = "llama3.2"
 
