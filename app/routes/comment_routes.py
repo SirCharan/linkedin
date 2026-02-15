@@ -1,3 +1,5 @@
+import asyncio
+from concurrent.futures import ThreadPoolExecutor
 from typing import Optional
 
 from fastapi import APIRouter, HTTPException
@@ -7,9 +9,11 @@ from app.ai.reply_generator import ReplyGenerator
 from app.auth.token_store import token_store
 from app.linkedin.client import LinkedInClient
 from app.linkedin.url_parser import extract_activity_urn
+from app.linkedin.voyager_client import extract_activity_id, post_comment as voyager_post_comment
 
 router = APIRouter(prefix="/api", tags=["comments"])
 reply_gen = ReplyGenerator()
+_executor = ThreadPoolExecutor(max_workers=2)
 
 
 def _get_client() -> LinkedInClient:
@@ -58,25 +62,27 @@ async def analyze_post(body: AnalyzeRequest):
 async def generate_replies(body: GenerateRequest):
     if not body.post_text.strip():
         raise HTTPException(status_code=400, detail="Post text is required")
-    suggestions = await reply_gen.generate_replies(
-        post_text=body.post_text,
-        num_suggestions=body.num_suggestions,
-        tone=body.tone,
-        user_context=body.user_context,
-    )
-    return {"suggestions": suggestions}
+    try:
+        suggestions = await reply_gen.generate_replies(
+            post_text=body.post_text,
+            num_suggestions=body.num_suggestions,
+            tone=body.tone,
+            user_context=body.user_context,
+        )
+        return {"suggestions": suggestions}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Reply generation failed: {e}")
 
 
 @router.post("/post-comment")
 async def post_comment(body: PostCommentRequest):
-    client = _get_client()
-    data = token_store.load_token()
-    if not data or not data.get("member_urn"):
-        raise HTTPException(status_code=401, detail="No member URN found")
-
-    result = await client.post_comment(
-        post_urn=body.post_urn,
-        actor_urn=data["member_urn"],
-        text=body.comment_text,
-    )
+    activity_id = extract_activity_id(body.post_urn)
+    try:
+        # Run synchronous linkedin_api in thread pool
+        loop = asyncio.get_event_loop()
+        result = await loop.run_in_executor(
+            _executor, voyager_post_comment, activity_id, body.comment_text
+        )
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=str(e))
     return {"success": True, "result": result}

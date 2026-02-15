@@ -7,6 +7,8 @@ def extract_activity_urn(url: str) -> str:
         r"urn:li:activity:(\d+)",
         r"urn:li:ugcPost:(\d+)",
         r"activity-(\d+)",
+        r"-(\d{19,20})-",          # /posts/user_slug-7428164893930876929-XOqa
+        r"/posts/[^?]*-(\d{19,20})",  # fallback without trailing dash
     ]
     for pattern in patterns:
         match = re.search(pattern, url)

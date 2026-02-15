@@ -55,5 +55,15 @@ class LinkedInClient:
                 headers=self.headers,
                 json=payload,
             )
-            resp.raise_for_status()
+            if resp.status_code >= 400:
+                detail = resp.text
+                try:
+                    detail = resp.json()
+                except Exception:
+                    pass
+                raise httpx.HTTPStatusError(
+                    f"LinkedIn API {resp.status_code}: {detail}",
+                    request=resp.request,
+                    response=resp,
+                )
             return resp.json()

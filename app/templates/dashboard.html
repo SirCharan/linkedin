@@ -5,12 +5,185 @@ document.getElementById('nav-right').innerHTML =
   '<button onclick="logout()" class="text-sm underline">Logout</button>';
 
 let currentUrn = '';
+let activeTab = 'auto';
+let autoPosts = [];  // Store discovered posts data
+let autoTone = 'professional';
+let autoCtx = '';
+
+function switchTab(tab) {
+  activeTab = tab;
+  document.getElementById('tab-auto').classList.toggle('border-blue-600', tab === 'auto');
+  document.getElementById('tab-auto').classList.toggle('text-blue-600', tab === 'auto');
+  document.getElementById('tab-auto').classList.toggle('border-transparent', tab !== 'auto');
+  document.getElementById('tab-manual').classList.toggle('border-blue-600', tab === 'manual');
+  document.getElementById('tab-manual').classList.toggle('text-blue-600', tab === 'manual');
+  document.getElementById('tab-manual').classList.toggle('border-transparent', tab !== 'manual');
+  document.getElementById('section-auto').classList.toggle('hidden', tab !== 'auto');
+  document.getElementById('section-manual').classList.toggle('hidden', tab !== 'manual');
+}
 
 async function logout() {
   await fetch('/auth/logout', {method:'POST'});
   location.reload();
 }
 
+// ====== AUTO-PILOT ======
+async function discoverPosts() {
+  const topic = document.getElementById('auto-topic').value.trim();
+  const tone = document.getElementById('auto-tone').value;
+  const ctx = document.getElementById('auto-context').value.trim();
+  const maxPosts = parseInt(document.getElementById('auto-max').value) || 5;
+  setStatus('Searching for trending posts...');
+  document.getElementById('auto-results').innerHTML = '';
+
+  try {
+    const res = await fetch('/api/auto/discover', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({topic, max_posts: maxPosts})
+    });
+    const data = await res.json();
+    if (!res.ok) { setStatus(data.detail || 'Error'); return; }
+    if (!data.posts || !data.posts.length) { setStatus(data.message || 'No posts found. Try different keywords.'); return; }
+
+    setStatus(`Found ${data.posts.length} posts. Generating replies...`);
+    renderAutoResults(data.posts, tone, ctx);
+  } catch(e) { setStatus('Network error: ' + e.message); }
+}
+
+async function renderAutoResults(posts, tone, ctx) {
+  // Store data in JS variables instead of inlining in onclick
+  autoPosts = posts;
+  autoTone = tone;
+  autoCtx = ctx;
+
+  const el = document.getElementById('auto-results');
+  el.innerHTML = '';
+
+  for (let i = 0; i < posts.length; i++) {
+    const p = posts[i];
+    const card = document.createElement('div');
+    card.className = 'bg-white rounded-lg shadow p-5 mb-4';
+    card.id = `auto-card-${i}`;
+
+    const safeText = p.text.substring(0, 250).replace(/</g, '&lt;').replace(/>/g, '&gt;');
+    const safeAuthor = (p.author || 'Unknown').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+
+    card.innerHTML = `
+      <div class="flex items-start justify-between mb-2">
+        <div>
+          <span class="text-sm font-semibold text-gray-800">${safeAuthor}</span>
+          <a href="${p.url}" target="_blank" class="ml-2 text-xs text-blue-500 hover:underline">View post</a>
+        </div>
+        <span class="text-xs text-gray-400">#${i + 1}</span>
+      </div>
+      <p class="text-sm text-gray-600 mb-3">${safeText}${p.text.length > 250 ? '...' : ''}</p>
+      <div class="border-t pt-3">
+        <div class="flex items-center gap-2 mb-2">
+          <span class="text-xs font-medium text-gray-500">AI Reply:</span>
+          <span id="auto-status-${i}" class="text-xs text-gray-400"></span>
+        </div>
+        <textarea id="auto-reply-${i}" class="w-full border rounded p-2 text-sm mb-2" rows="2" placeholder="Generating..."></textarea>
+        <div class="flex gap-2">
+          <button onclick="regenReply(${i})"
+            class="bg-gray-200 hover:bg-gray-300 text-gray-700 text-xs font-medium py-1.5 px-3 rounded transition">
+            Regenerate
+          </button>
+          <button onclick="postAutoReply(${i})"
+            class="bg-blue-600 hover:bg-blue-700 text-white text-xs font-medium py-1.5 px-3 rounded transition">
+            Post Reply
+          </button>
+        </div>
+      </div>
+    `;
+    el.appendChild(card);
+  }
+
+  // Generate replies one at a time (Ollama processes sequentially)
+  for (let i = 0; i < posts.length; i++) {
+    setStatus(`Generating reply ${i + 1} of ${posts.length}...`);
+    await generateOneReply(i);
+  }
+  setStatus(`Done! ${posts.length} replies ready. Review and click "Post Reply" to engage.`);
+}
+
+function regenReply(idx) { generateOneReply(idx); }
+
+async function generateOneReply(idx) {
+  const p = autoPosts[idx];
+  const textarea = document.getElementById(`auto-reply-${idx}`);
+  const status = document.getElementById(`auto-status-${idx}`);
+  textarea.value = '';
+  status.textContent = 'generating...';
+  status.className = 'text-xs text-yellow-600';
+
+  try {
+    const res = await fetch('/api/generate-replies', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({
+        post_text: p.text,
+        post_urn: p.urn || '',
+        tone: autoTone,
+        user_context: autoCtx || null,
+        num_suggestions: 1
+      })
+    });
+    const data = await res.json();
+    if (res.ok && data.suggestions && data.suggestions.length) {
+      textarea.value = data.suggestions[0];
+      status.textContent = 'ready';
+      status.className = 'text-xs text-green-600';
+    } else {
+      status.textContent = data.detail || 'failed';
+      status.className = 'text-xs text-red-500';
+    }
+  } catch(e) {
+    status.textContent = 'error: ' + e.message;
+    status.className = 'text-xs text-red-500';
+  }
+}
+
+async function postAutoReply(idx) {
+  const p = autoPosts[idx];
+  const text = document.getElementById(`auto-reply-${idx}`).value.trim();
+  if (!text || !p.urn) { alert('Missing reply text or post URN'); return; }
+  const status = document.getElementById(`auto-status-${idx}`);
+  status.textContent = 'posting...';
+  status.className = 'text-xs text-yellow-600';
+
+  try {
+    const res = await fetch('/api/post-comment', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({post_urn: p.urn, comment_text: text})
+    });
+    const data = await res.json();
+    if (res.ok && data.success) {
+      status.textContent = 'posted!';
+      status.className = 'text-xs text-green-600 font-semibold';
+      document.getElementById(`auto-reply-${idx}`).disabled = true;
+    } else {
+      status.textContent = data.detail || 'failed to post';
+      status.className = 'text-xs text-red-500';
+    }
+  } catch(e) {
+    status.textContent = 'error: ' + e.message;
+    status.className = 'text-xs text-red-500';
+  }
+}
+
+async function autoPostAll() {
+  setStatus(`Auto-posting ${autoPosts.length} replies...`);
+  for (let i = 0; i < autoPosts.length; i++) {
+    const ta = document.getElementById(`auto-reply-${i}`);
+    if (!ta || ta.disabled) continue;
+    setStatus(`Posting reply ${i + 1} of ${autoPosts.length}... (rate limit: 60s between posts)`);
+    await postAutoReply(i);
+    // Respect LinkedIn rate limits
+    if (i < autoPosts.length - 1) await new Promise(r => setTimeout(r, 65000));
+  }
+  setStatus('All replies posted!');
+}
+
+// ====== MANUAL MODE ======
 async function analyzePost() {
   const url = document.getElementById('post-url').value.trim();
   if (!url) return;
@@ -92,51 +265,113 @@ function setStatus(msg) {
 }
 </script>
 
-<!-- URL input -->
-<div class="bg-white rounded-xl shadow-md p-6 mb-6">
-  <label class="block text-sm font-medium text-gray-700 mb-2">LinkedIn Post URL</label>
-  <div class="flex gap-2">
-    <input id="post-url" type="text" placeholder="https://www.linkedin.com/feed/update/..."
-      class="flex-1 border rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500">
-    <button onclick="analyzePost()"
-      class="bg-blue-600 hover:bg-blue-700 text-white font-medium py-2 px-5 rounded-lg transition text-sm">
-      Analyze
-    </button>
-  </div>
-</div>
-
-<!-- Post content + options -->
-<div id="post-section" class="hidden bg-white rounded-xl shadow-md p-6 mb-6">
-  <label class="block text-sm font-medium text-gray-700 mb-2">Post Content</label>
-  <textarea id="post-text" rows="5"
-    class="w-full border rounded-lg px-3 py-2 text-sm mb-4 focus:outline-none focus:ring-2 focus:ring-blue-500"
-    placeholder="Post text will appear here..."></textarea>
-
-  <div class="grid grid-cols-2 gap-4 mb-4">
-    <div>
-      <label class="block text-xs font-medium text-gray-500 mb-1">Tone</label>
-      <select id="tone" class="w-full border rounded px-2 py-1.5 text-sm">
-        <option value="professional">Professional</option>
-        <option value="casual">Casual</option>
-        <option value="technical">Technical</option>
-        <option value="thoughtful">Thoughtful</option>
-      </select>
-    </div>
-    <div>
-      <label class="block text-xs font-medium text-gray-500 mb-1">Your Context (optional)</label>
-      <input id="user-context" type="text" placeholder="e.g. I'm a software engineer"
-        class="w-full border rounded px-2 py-1.5 text-sm">
-    </div>
-  </div>
-
-  <button onclick="generateReplies()"
-    class="bg-green-600 hover:bg-green-700 text-white font-medium py-2 px-6 rounded-lg transition text-sm">
-    Generate Replies
+<!-- Tabs -->
+<div class="flex border-b mb-6">
+  <button id="tab-auto" onclick="switchTab('auto')"
+    class="px-5 py-2.5 text-sm font-medium border-b-2 border-blue-600 text-blue-600 transition">
+    Auto-Pilot
+  </button>
+  <button id="tab-manual" onclick="switchTab('manual')"
+    class="px-5 py-2.5 text-sm font-medium border-b-2 border-transparent text-gray-500 hover:text-gray-700 transition">
+    Manual
   </button>
 </div>
 
-<!-- Suggestions -->
-<div id="suggestions"></div>
+<!-- ====== AUTO-PILOT TAB ====== -->
+<div id="section-auto">
+  <div class="bg-white rounded-xl shadow-md p-6 mb-6">
+    <h2 class="text-lg font-semibold mb-1">Auto-Pilot Mode</h2>
+    <p class="text-sm text-gray-500 mb-4">Finds trending LinkedIn posts and generates smart replies automatically.</p>
+
+    <div class="grid grid-cols-2 gap-4 mb-4">
+      <div class="col-span-2">
+        <label class="block text-xs font-medium text-gray-500 mb-1">Topic / Keywords</label>
+        <input id="auto-topic" type="text" value="crypto OR cryptocurrency OR stock market OR trading"
+          class="w-full border rounded px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500">
+      </div>
+      <div>
+        <label class="block text-xs font-medium text-gray-500 mb-1">Tone</label>
+        <select id="auto-tone" class="w-full border rounded px-2 py-1.5 text-sm">
+          <option value="professional">Professional</option>
+          <option value="casual">Casual</option>
+          <option value="technical">Technical</option>
+          <option value="thoughtful" selected>Thoughtful</option>
+        </select>
+      </div>
+      <div>
+        <label class="block text-xs font-medium text-gray-500 mb-1">Max Posts</label>
+        <select id="auto-max" class="w-full border rounded px-2 py-1.5 text-sm">
+          <option value="3">3</option>
+          <option value="5" selected>5</option>
+          <option value="8">8</option>
+          <option value="10">10</option>
+        </select>
+      </div>
+      <div class="col-span-2">
+        <label class="block text-xs font-medium text-gray-500 mb-1">Your Context (helps AI personalize replies)</label>
+        <input id="auto-context" type="text" placeholder="e.g. crypto trader, software engineer, fintech founder"
+          class="w-full border rounded px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500">
+      </div>
+    </div>
+
+    <div class="flex gap-3">
+      <button onclick="discoverPosts()"
+        class="bg-blue-600 hover:bg-blue-700 text-white font-medium py-2 px-6 rounded-lg transition text-sm">
+        Find Posts & Generate Replies
+      </button>
+      <button onclick="autoPostAll()"
+        class="bg-green-600 hover:bg-green-700 text-white font-medium py-2 px-6 rounded-lg transition text-sm">
+        Post All Replies
+      </button>
+    </div>
+  </div>
+
+  <div id="auto-results"></div>
+</div>
+
+<!-- ====== MANUAL TAB ====== -->
+<div id="section-manual" class="hidden">
+  <div class="bg-white rounded-xl shadow-md p-6 mb-6">
+    <label class="block text-sm font-medium text-gray-700 mb-2">LinkedIn Post URL</label>
+    <div class="flex gap-2">
+      <input id="post-url" type="text" placeholder="https://www.linkedin.com/feed/update/..."
+        class="flex-1 border rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500">
+      <button onclick="analyzePost()"
+        class="bg-blue-600 hover:bg-blue-700 text-white font-medium py-2 px-5 rounded-lg transition text-sm">
+        Analyze
+      </button>
+    </div>
+  </div>
+
+  <div id="post-section" class="hidden bg-white rounded-xl shadow-md p-6 mb-6">
+    <label class="block text-sm font-medium text-gray-700 mb-2">Post Content</label>
+    <textarea id="post-text" rows="5"
+      class="w-full border rounded-lg px-3 py-2 text-sm mb-4 focus:outline-none focus:ring-2 focus:ring-blue-500"
+      placeholder="Post text will appear here..."></textarea>
+    <div class="grid grid-cols-2 gap-4 mb-4">
+      <div>
+        <label class="block text-xs font-medium text-gray-500 mb-1">Tone</label>
+        <select id="tone" class="w-full border rounded px-2 py-1.5 text-sm">
+          <option value="professional">Professional</option>
+          <option value="casual">Casual</option>
+          <option value="technical">Technical</option>
+          <option value="thoughtful">Thoughtful</option>
+        </select>
+      </div>
+      <div>
+        <label class="block text-xs font-medium text-gray-500 mb-1">Your Context (optional)</label>
+        <input id="user-context" type="text" placeholder="e.g. I'm a software engineer"
+          class="w-full border rounded px-2 py-1.5 text-sm">
+      </div>
+    </div>
+    <button onclick="generateReplies()"
+      class="bg-green-600 hover:bg-green-700 text-white font-medium py-2 px-6 rounded-lg transition text-sm">
+      Generate Replies
+    </button>
+  </div>
+
+  <div id="suggestions"></div>
+</div>
 
 <!-- Status -->
 <p id="status" class="text-sm text-gray-500 mt-4 text-center"></p>
